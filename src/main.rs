@@ -1,5 +1,37 @@
+use clap::{App, Arg};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let matches = App::new("Triage Tracker")
+        .arg(
+            Arg::with_name("date")
+                .short("d")
+                .long("date")
+                .value_name("DATE")
+                .takes_value(true),
+        )
+        .get_matches();
+    let date = matches
+        .value_of("date")
+        .map(|d| d.parse::<chrono::NaiveDate>().unwrap())
+        .unwrap_or_else(|| chrono::Utc::today().pred().naive_utc());
+    let items = Issues::for_date(date).await?;
+
+    println!("On {}", date.format("%Y-%m-%d"));
+    let opened = items.opened().collect::<Vec<_>>();
+    println!("{} opened: ", opened.len());
+    for i in opened {
+        println!("  {}", i);
+    }
+    let closed = items.closed().collect::<Vec<_>>();
+    println!("{} closed: ", closed.len());
+    for i in items.closed() {
+        println!("  {}", i);
+    }
+    Ok(())
+}
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, BoxedError>;
@@ -53,31 +85,32 @@ impl Event {
 }
 
 trait Dated {
-    fn date(&self) -> chrono::Date<chrono::Utc>;
-    fn is_relevant_for_date(&self, date: &chrono::Date<chrono::Utc>) -> bool;
+    fn date(&self) -> chrono::NaiveDate;
+    fn is_relevant_for_date(&self, date: &chrono::NaiveDate) -> bool;
 }
 
 trait Paged {
+    const ESTIMATED_PAGES_PER_DAY: u32;
     // Given a date, provide the best guess as to which page to start looking at
-    fn page_for_date(date: chrono::Date<chrono::Utc>) -> u32;
+    fn page_for_date(date: chrono::NaiveDate) -> u32;
 }
 
 impl Dated for Event {
-    fn date(&self) -> chrono::Date<chrono::Utc> {
-        self.when.date()
+    fn date(&self) -> chrono::NaiveDate {
+        self.when.date().naive_utc()
     }
 
-    fn is_relevant_for_date(&self, date: &chrono::Date<chrono::Utc>) -> bool {
-        !matches!(self.id, EventId::Unknown) && &self.when.date() == date
+    fn is_relevant_for_date(&self, date: &chrono::NaiveDate) -> bool {
+        !matches!(self.id, EventId::Unknown) && &self.date() == date
     }
 }
 
-const ESTIMATED_PAGES_PER_DAY: u32 = 7;
 impl Paged for Event {
-    fn page_for_date(date: chrono::Date<chrono::Utc>) -> u32 {
-        let days_away = (chrono::Utc::today() - date).num_days();
+    const ESTIMATED_PAGES_PER_DAY: u32 = 4;
+    fn page_for_date(date: chrono::NaiveDate) -> u32 {
+        let days_away = (chrono::Utc::today().naive_utc() - date).num_days();
         if days_away > 1 {
-            (days_away as u32) * ESTIMATED_PAGES_PER_DAY
+            (days_away as u32) * Self::ESTIMATED_PAGES_PER_DAY
         } else if days_away == 1 {
             use chrono::Timelike;
             // TODO: this will change during the day and needs to be adjusted
@@ -107,31 +140,20 @@ impl Issue {
 }
 
 impl Dated for Issue {
-    fn date(&self) -> chrono::Date<chrono::Utc> {
-        self.created_at.date()
+    fn date(&self) -> chrono::NaiveDate {
+        self.created_at.date().naive_utc()
     }
 
-    fn is_relevant_for_date(&self, date: &chrono::Date<chrono::Utc>) -> bool {
-        &self.created_at.date() == date
+    fn is_relevant_for_date(&self, date: &chrono::NaiveDate) -> bool {
+        &self.date() == date
     }
 }
 
 impl Paged for Issue {
-    fn page_for_date(date: chrono::Date<chrono::Utc>) -> u32 {
-        let days_away = (chrono::Utc::today() - date).num_days();
-        if days_away > 1 {
-            (days_away as u32) * ESTIMATED_PAGES_PER_DAY
-        } else if days_away == 1 {
-            use chrono::Timelike;
-            // TODO: this will change during the day and needs to be adjusted
-            println!(
-                "Selected yesterday: {} hours away",
-                chrono::Utc::now().time().hour()
-            );
-            1
-        } else {
-            0
-        }
+    const ESTIMATED_PAGES_PER_DAY: u32 = 1;
+    fn page_for_date(date: chrono::NaiveDate) -> u32 {
+        let days_away = (chrono::Utc::today().naive_utc() - date).num_days();
+        (days_away as u32) / 6
     }
 }
 
@@ -159,28 +181,12 @@ struct Actor {
     login: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let date = chrono::Utc::today().pred();
-    let items = Issues::for_date(date).await?;
-
-    println!("Opened: ");
-    for i in items.opened() {
-        println!("  {}", i);
-    }
-    println!("Closed: ");
-    for i in items.closed() {
-        println!("  {}", i);
-    }
-    Ok(())
-}
-
 struct Issues {
     items: Vec<IssueOrEvent>,
 }
 
 impl Issues {
-    async fn for_date(date: chrono::Date<chrono::Utc>) -> Result<Self> {
+    async fn for_date(date: chrono::NaiveDate) -> Result<Self> {
         let (events, issues) = tokio::join!(events_for_date(date), issues_for_date(date));
         let events = events?;
         let issues = issues?;
@@ -217,7 +223,7 @@ impl Issues {
     }
 }
 
-async fn events_for_date(date: chrono::Date<chrono::Utc>) -> Result<Vec<Event>> {
+async fn events_for_date(date: chrono::NaiveDate) -> Result<Vec<Event>> {
     let es = match read_cache(&date, CacheType::Events).await? {
         Some(es) => es,
         None => {
@@ -229,7 +235,7 @@ async fn events_for_date(date: chrono::Date<chrono::Utc>) -> Result<Vec<Event>> 
     Ok(es)
 }
 
-async fn issues_for_date(date: chrono::Date<chrono::Utc>) -> Result<Vec<Issue>> {
+async fn issues_for_date(date: chrono::NaiveDate) -> Result<Vec<Issue>> {
     let es = match read_cache(&date, CacheType::Issues).await? {
         Some(es) => es,
         None => {
@@ -258,7 +264,7 @@ impl std::fmt::Display for CacheType {
 }
 
 async fn read_cache<T: serde::de::DeserializeOwned>(
-    date: &chrono::Date<chrono::Utc>,
+    date: &chrono::NaiveDate,
     cache_type: CacheType,
 ) -> Result<Option<Vec<T>>> {
     let path = cache_path(date, cache_type);
@@ -282,7 +288,7 @@ async fn read_cache<T: serde::de::DeserializeOwned>(
 }
 
 async fn write_cache<T: Serialize>(
-    date: &chrono::Date<chrono::Utc>,
+    date: &chrono::NaiveDate,
     events: &Vec<T>,
     cache_type: CacheType,
 ) -> Result<()> {
@@ -292,25 +298,25 @@ async fn write_cache<T: Serialize>(
     Ok(tokio::fs::write(&path, &events).await?)
 }
 
-fn cache_path(date: &chrono::Date<chrono::Utc>, cache_type: CacheType) -> String {
+fn cache_path(date: &chrono::NaiveDate, cache_type: CacheType) -> String {
     format!("database/{}-{}.json", date.format("%Y-%m-%d"), cache_type)
 }
 
-async fn fetch_issues_for_date(date: chrono::Date<chrono::Utc>) -> Result<Vec<Issue>> {
+async fn fetch_issues_for_date(date: chrono::NaiveDate) -> Result<Vec<Issue>> {
     fetch_for_date(date, |page| fetch_issue_page(page, 100)).await
 }
 
-async fn fetch_events_for_date(date: chrono::Date<chrono::Utc>) -> Result<Vec<Event>> {
+async fn fetch_events_for_date(date: chrono::NaiveDate) -> Result<Vec<Event>> {
     fetch_for_date(date, |page| fetch_event_page(page, 100)).await
 }
 
-async fn fetch_for_date<T, F, Fut>(date: chrono::Date<chrono::Utc>, fetch: F) -> Result<Vec<T>>
+async fn fetch_for_date<T, F, Fut>(date: chrono::NaiveDate, fetch: F) -> Result<Vec<T>>
 where
     T: Dated + Paged,
     F: Fn(u32) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<T>>>,
 {
-    let today = chrono::Utc::today();
+    let today = chrono::Utc::today().naive_utc();
     let days_away = (today - date).num_days();
     assert!(days_away >= 0);
     let mut page_number = T::page_for_date(date.clone());
@@ -337,7 +343,9 @@ where
                     break;
                 }
                 if r.start == 0 && fetch_index == 0 {
-                    todo!("Handle when the date spans page before first page fetched");
+                    println!("In the middle of the day. Going back 1 page...");
+                    page_number -= 1;
+                    continue;
                 }
                 if r.end != (page_length - 1) {
                     println!("We reached the end of the date");
@@ -352,9 +360,19 @@ where
                 println!("No items for '{:?}' contained in page", date);
                 let first = &page[0].date();
                 let last = &page[page_length - 1].date();
-                println!("First event in page from '{:?}'", first);
-                println!("Last event in page from '{:?}'", last);
-                todo!("Handle when the page does not contain any dates");
+                if last > &date {
+                    let diff = (*last - date).num_days() as u32;
+                    let pages = diff * T::ESTIMATED_PAGES_PER_DAY;
+                    println!("{} days in future... going back {} pages", diff, pages);
+                    page_number += pages;
+                } else {
+                    println!("First item in page from '{:?}'", first);
+                    println!("Last item in page from '{:?}'", last);
+                    let diff = (date - *last).num_days() as u32;
+                    let pages = diff * T::ESTIMATED_PAGES_PER_DAY;
+                    page_number -= pages;
+                    println!("{} days in future... going back {} pages", diff, pages);
+                }
             }
         }
     }
