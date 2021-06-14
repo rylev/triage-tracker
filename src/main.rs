@@ -17,22 +17,26 @@ struct Event {
     issue: Issue,
     #[serde(rename = "created_at")]
     when: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Issue {
+    number: u32,
+    title: String,
     pull_request: Option<PullRequest>,
+}
+
+impl Issue {
+    fn is_pull_request(&self) -> bool {
+        self.pull_request.is_some()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct PullRequest {}
 
 #[derive(Serialize, Deserialize, Debug)]
-struct Issue {
-    number: u32,
-    title: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
 enum EventId {
-    #[serde(rename = "opened")]
-    Open,
     #[serde(rename = "closed")]
     Closed,
     #[serde(rename = "reopened")]
@@ -44,20 +48,37 @@ enum EventId {
 #[tokio::main]
 async fn main() -> Result<()> {
     let date = chrono::Utc::today().pred();
-    let events = match read_cache(&date).await? {
-        Some(c) => c,
+    let events = events_for_date(date).await?;
+    println!(
+        "Pull Requests closed {:#?}",
+        events
+            .iter()
+            .filter_map(|e| {
+                if e.issue.is_pull_request() && matches!(e.id, EventId::Closed) {
+                    Some(e.issue.number)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+async fn events_for_date(date: chrono::Date<chrono::Utc>) -> Result<Vec<Event>> {
+    let es = match read_cache(&date).await? {
+        Some(es) => es,
         None => {
-            let events = events_for_date(date).await?;
+            let events = fetch_events_for_date(date).await?;
             let _ = write_cache(&date, &events).await;
             events
         }
     };
-    println!("{:#?}", events);
-    Ok(())
+    Ok(es)
 }
 
 async fn read_cache(date: &chrono::Date<chrono::Utc>) -> Result<Option<Vec<Event>>> {
-    let path = format!("database/{}.json", date.format("%Y-%m-%d"));
+    let path = cache_path(date);
     println!("Trying to read from cache: '{}'", path);
     let result = tokio::fs::read(&path).await;
     if let Err(std::io::ErrorKind::NotFound) = result.as_ref().map_err(|e| e.kind()) {
@@ -76,14 +97,19 @@ async fn read_cache(date: &chrono::Date<chrono::Utc>) -> Result<Option<Vec<Event
     };
     Ok(es)
 }
+
 async fn write_cache(date: &chrono::Date<chrono::Utc>, events: &Vec<Event>) -> Result<()> {
-    let path = format!("database/{}.json", date.format("%Y-%m-%d"));
+    let path = cache_path(date);
     println!("Writing to cache: '{}'", path);
     let events = serde_json::to_vec(&events)?;
     Ok(tokio::fs::write(&path, &events).await?)
 }
 
-async fn events_for_date(date: chrono::Date<chrono::Utc>) -> Result<Vec<Event>> {
+fn cache_path(date: &chrono::Date<chrono::Utc>) -> String {
+    format!("database/{}-events.json", date.format("%Y-%m-%d"))
+}
+
+async fn fetch_events_for_date(date: chrono::Date<chrono::Utc>) -> Result<Vec<Event>> {
     let today = chrono::Utc::today();
     let days_away = (today - date).num_days();
     assert!(days_away >= 0);
@@ -149,42 +175,6 @@ async fn events_for_date(date: chrono::Date<chrono::Utc>) -> Result<Vec<Event>> 
     }
 
     Ok(events)
-}
-
-// async fn fetch_latest_events(n: u32) -> Result<Vec<Event>> {
-//     let mut events = Vec::with_capacity(n as usize);
-//     let mut page = 0u32;
-//     loop {
-//         page += 1;
-//         let before = events.len();
-//         let new_events = fetch_page(page, 100).await?;
-//         let after = before + new_events.len();
-//         let new_events = new_events
-//             .into_iter()
-//             .filter(|e| !matches!(e.id, EventId::Unknown));
-//         events.extend(new_events);
-//         if before == after || events.len() >= n as usize {
-//             break;
-//         }
-//     }
-//     Ok(events)
-// }
-
-#[derive(Default, Debug)]
-struct EventIterator {
-    page: u32,
-}
-
-impl EventIterator {
-    fn new(page: u32) -> Self {
-        Self { page }
-    }
-
-    async fn next(&mut self) -> Result<Option<Vec<Event>>> {
-        let fetched = fetch_page(self.page, 100).await?;
-        self.page += 1;
-        Ok((!fetched.is_empty()).then(|| fetched))
-    }
 }
 
 async fn fetch_page(page: u32, per_page: u8) -> Result<Vec<Event>> {
