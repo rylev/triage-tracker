@@ -7,6 +7,7 @@ mod gui;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
     let matches = App::new("Triage Tracker")
         .arg(
             Arg::with_name("date")
@@ -390,6 +391,7 @@ where
     let mut page_number = T::page_for_date(date.clone());
     let mut items = Vec::new();
     let mut fetch_index = 0;
+    let mut pages_per_day = T::ESTIMATED_PAGES_PER_DAY;
     loop {
         let page = fetch(page_number).await?;
         if page.is_empty() {
@@ -409,38 +411,50 @@ where
                     // The page contained all items for the date
                     debug!("All items for '{:?}' contained in page. Breaking...", date);
                     break;
-                }
-                if r.start == 0 && fetch_index == 0 {
+                } else if r.start == 0 && fetch_index == 0 {
+                    // TODO: we throw away results here that we could keep
                     debug!("In the middle of the day. Going back 1 page...");
                     page_number -= 1;
-                    continue;
-                }
-                if r.end != (page_length - 1) {
+                } else if r.end != (page_length - 1) {
                     debug!("We reached the end of the date");
                     break;
+                } else {
+                    debug!("Date '{:?}' spans beyond page", date);
+                    page_number += 1;
+                    fetch_index += 1;
                 }
-                debug!("Date '{:?}' spans beyond page", date);
-                page_number += 1;
-                fetch_index += 1;
             }
             None => {
                 // No items in this page matched the date
-                debug!("No items for '{:?}' contained in page", date);
-                let first = &page[0].date();
-                let last = &page[page_length - 1].date();
-                if last > &date {
-                    let diff = (*last - date).num_days() as u32;
+                debug!(
+                    "No items for '{:?}' contained in page {}",
+                    date, page_number
+                );
+                let most_recent = &page[0].date();
+                let least_recent = &page[page_length - 1].date();
+                if least_recent > &date {
+                    let diff = (*least_recent - date).num_days() as u32;
                     let pages = diff * T::ESTIMATED_PAGES_PER_DAY;
-                    debug!("{} days in future... going back {} pages", diff, pages);
+                    debug!(
+                        "{} days in future... going back in time +{} pages",
+                        diff, pages
+                    );
                     page_number += pages;
                 } else {
-                    debug!("First item in page from '{:?}'", first);
-                    debug!("Last item in page from '{:?}'", last);
-                    let diff = (date - *last).num_days() as u32;
-                    let pages = diff * T::ESTIMATED_PAGES_PER_DAY;
-                    page_number -= pages;
-                    debug!("{} days in future... going back {} pages", diff, pages);
+                    debug!("First item in page from '{:?}'", most_recent);
+                    debug!("Last item in page from '{:?}'", least_recent);
+                    let diff = (date - *most_recent).num_days() as u32;
+                    let pages = diff * pages_per_day;
+                    debug!(
+                        "{} days in past... moving forward in time -{} pages",
+                        diff, pages
+                    );
+                    page_number = page_number
+                        .checked_sub(pages)
+                        .unwrap_or_else(|| page_number - 1)
                 }
+                // Decrease the pages per day estimate to avoid swinging back and forth
+                pages_per_day = pages_per_day.checked_add(1).unwrap_or(0);
             }
         }
     }
@@ -473,7 +487,14 @@ async fn fetch_page<T: serde::de::DeserializeOwned>(
         .header("User-Agent", "rust-triage-tracker")
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status()
+        .map_err(|e| -> BoxedError {
+            if let Some(reqwest::StatusCode::FORBIDDEN) = e.status() {
+                "hit the GitHub rate limit".into()
+            } else {
+                e.into()
+            }
+        })?
         .json()
         .await?)
 }
