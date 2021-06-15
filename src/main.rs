@@ -1,6 +1,9 @@
 use clap::{App, Arg};
+use log::debug;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+
+mod gui;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -65,14 +68,6 @@ async fn handle_date(date: chrono::NaiveDate) -> Result<()> {
     Ok(())
 }
 
-use termion::raw::IntoRawMode;
-use termion::screen::AlternateScreen;
-use tui::backend::TermionBackend;
-use tui::style::{Color, Modifier, Style};
-use tui::text::Span;
-use tui::widgets::{BarChart, Block, Borders};
-use tui::Terminal;
-
 async fn handle_range(start: chrono::NaiveDate, end: chrono::NaiveDate) -> Result<()> {
     if end >= start {
         return Err("--start must be more recent than --end".into());
@@ -86,80 +81,16 @@ async fn handle_range(start: chrono::NaiveDate, end: chrono::NaiveDate) -> Resul
             break;
         }
     }
-    let data = std::sync::Arc::new(
-        issues
-            .into_iter()
-            .map(|(date, issues)| {
-                (
-                    date.format("%Y-%m-%d").to_string(),
-                    issues.opened().count() as u64,
-                )
-            })
-            .collect::<Vec<_>>(),
-    );
-
-    // Terminal initialization
-    let stdout = std::io::stdout().into_raw_mode()?;
-    let stdout = AlternateScreen::from(stdout);
-    let backend = TermionBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    enum Event {
-        Key(termion::event::Key),
-        Tick,
+    // TUI
+    // gui::gui(issues).await?;
+    let mut total: isize = 0;
+    println!("Daily changes:");
+    for (d, i) in issues {
+        let diff = i.diff();
+        total += diff;
+        println!("{}: {}", d.format(" %Y-%m-%d"), diff);
     }
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    let stdin = std::io::stdin();
-    use termion::input::TermRead;
-    let tx_clone = tx.clone();
-    tokio::spawn(async move {
-        for evt in stdin.keys() {
-            if let Ok(key) = evt {
-                if let Err(_) = tx_clone.send(Event::Key(key)).await {
-                    return;
-                }
-            }
-        }
-    });
-    tokio::spawn(async move {
-        loop {
-            if let Err(_) = tx.send(Event::Tick).await {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-    });
-    loop {
-        match rx.recv().await {
-            Some(Event::Key(termion::event::Key::Char('q'))) | None => {
-                break;
-            }
-            _ => {}
-        }
-        let data = data.clone();
-        terminal.draw(move |f| {
-            let size = f.size();
-            let d = data
-                .iter()
-                .map(|(s, n)| (s.as_str(), *n))
-                .collect::<Vec<(&str, u64)>>();
-            let chart = BarChart::default()
-                .block(
-                    Block::default()
-                        .title(Span::styled(
-                            "Issues Opened",
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ))
-                        .borders(Borders::ALL),
-                )
-                .bar_width(10)
-                .bar_style(Style::default().fg(Color::LightBlue))
-                .data(d.as_slice());
-            f.render_widget(chart, size);
-        })?;
-    }
-    rx.close();
+    println!("Total Change: {}", total);
     Ok(())
 }
 
@@ -244,7 +175,7 @@ impl Paged for Event {
         } else if days_away == 1 {
             use chrono::Timelike;
             // TODO: this will change during the day and needs to be adjusted
-            println!(
+            debug!(
                 "Selected yesterday: {} hours away",
                 chrono::Utc::now().time().hour()
             );
@@ -405,10 +336,10 @@ async fn read_cache<T: serde::de::DeserializeOwned>(
     cache_type: CacheType,
 ) -> Result<Option<Vec<T>>> {
     let path = cache_path(date, cache_type);
-    println!("Trying to read from '{}' cache @ '{}'", cache_type, path);
+    debug!("Trying to read from '{}' cache @ '{}'", cache_type, path);
     let result = tokio::fs::read(&path).await;
     if let Err(std::io::ErrorKind::NotFound) = result.as_ref().map_err(|e| e.kind()) {
-        println!("'{}' not in cache", path);
+        debug!("'{}' not in cache", path);
         return Ok(None);
     }
     let result = result?;
@@ -416,7 +347,7 @@ async fn read_cache<T: serde::de::DeserializeOwned>(
     let es = match serde_json::from_slice(&result) {
         Ok(es) => Some(es),
         Err(_) => {
-            println!("Failed to parse cache for '{}' as JSON. Deleteing...", date);
+            debug!("Failed to parse cache for '{}' as JSON. Deleteing...", date);
             let _ = tokio::fs::remove_file(&path).await;
             None
         }
@@ -430,7 +361,7 @@ async fn write_cache<T: Serialize>(
     cache_type: CacheType,
 ) -> Result<()> {
     let path = cache_path(date, cache_type);
-    println!("Writing to cache: '{}'", path);
+    debug!("Writing to cache: '{}'", path);
     let events = serde_json::to_vec(&events)?;
     Ok(tokio::fs::write(&path, &events).await?)
 }
@@ -471,44 +402,44 @@ where
         match range {
             Some(r) => {
                 // At least some items were for this date
-                println!("At least some items found in range '{:?}", r);
+                debug!("At least some items found in range '{:?}", r);
                 let i = page.into_iter().filter(|e| e.is_relevant_for_date(&date));
                 items.extend(i);
                 if r.start != 0 && r.end != (page_length - 1) {
                     // The page contained all items for the date
-                    println!("All items for '{:?}' contained in page. Breaking...", date);
+                    debug!("All items for '{:?}' contained in page. Breaking...", date);
                     break;
                 }
                 if r.start == 0 && fetch_index == 0 {
-                    println!("In the middle of the day. Going back 1 page...");
+                    debug!("In the middle of the day. Going back 1 page...");
                     page_number -= 1;
                     continue;
                 }
                 if r.end != (page_length - 1) {
-                    println!("We reached the end of the date");
+                    debug!("We reached the end of the date");
                     break;
                 }
-                println!("Date '{:?}' spans beyond page", date);
+                debug!("Date '{:?}' spans beyond page", date);
                 page_number += 1;
                 fetch_index += 1;
             }
             None => {
                 // No items in this page matched the date
-                println!("No items for '{:?}' contained in page", date);
+                debug!("No items for '{:?}' contained in page", date);
                 let first = &page[0].date();
                 let last = &page[page_length - 1].date();
                 if last > &date {
                     let diff = (*last - date).num_days() as u32;
                     let pages = diff * T::ESTIMATED_PAGES_PER_DAY;
-                    println!("{} days in future... going back {} pages", diff, pages);
+                    debug!("{} days in future... going back {} pages", diff, pages);
                     page_number += pages;
                 } else {
-                    println!("First item in page from '{:?}'", first);
-                    println!("Last item in page from '{:?}'", last);
+                    debug!("First item in page from '{:?}'", first);
+                    debug!("Last item in page from '{:?}'", last);
                     let diff = (date - *last).num_days() as u32;
                     let pages = diff * T::ESTIMATED_PAGES_PER_DAY;
                     page_number -= pages;
-                    println!("{} days in future... going back {} pages", diff, pages);
+                    debug!("{} days in future... going back {} pages", diff, pages);
                 }
             }
         }
@@ -518,12 +449,12 @@ where
 }
 
 async fn fetch_event_page(page: u32, per_page: u8) -> Result<Vec<Event>> {
-    println!("Fetching event page {}", page);
+    debug!("Fetching event page {}", page);
     fetch_page("issues/events", page, per_page).await
 }
 
 async fn fetch_issue_page(page: u32, per_page: u8) -> Result<Vec<Issue>> {
-    println!("Fetching issue page {}", page);
+    debug!("Fetching issue page {}", page);
     fetch_page("issues", page, per_page).await
 }
 
