@@ -77,7 +77,7 @@ async fn handle_triaged(tags: Vec<String>) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     };
-    let result = match perform_loop(&tags, &mut untriaged, &mut cache).await {
+    let result = match perform_triage_loop(&tags, &mut untriaged, &mut cache).await {
         r @ Ok(()) | r @ Err(Error::RateLimited) => {
             let cache = serde_json::to_vec(&cache).unwrap();
             if let Err(e) = tokio::fs::write("./database/triage.json", cache).await {
@@ -101,15 +101,21 @@ async fn handle_triaged(tags: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-async fn perform_loop(
+async fn perform_triage_loop(
     tags: &[String],
     untriaged: &mut Vec<Issue>,
     cache: &mut HashMap<u32, chrono::NaiveDate>,
 ) -> Result<()> {
     let mut page = 1;
     loop {
-        let issues =
-            github::fetch_issue_page(page, 100, &tags, github::Direction::OldestFirst).await?;
+        let issues = github::fetch_issue_page(
+            page,
+            100,
+            &tags,
+            github::SortedBy::Comments,
+            github::Direction::OldestFirst,
+        )
+        .await?;
         if issues.is_empty() {
             debug!("No more issues in page. Breaking...");
             break;
@@ -117,6 +123,19 @@ async fn perform_loop(
         let today = chrono::Local::today().naive_local();
         let one_year_ago = today - chrono::Duration::days(365);
         for issue in issues {
+            if issue.comments == 0 {
+                debug!("Issue #{} has no comments", issue.number);
+                // Issue has no comments
+                let created_at = issue.created_at.date().naive_local();
+                if created_at < one_year_ago {
+                    debug!("Issue without comments was created more than one year ago");
+                    untriaged.push(issue);
+                } else {
+                    debug!("Issue without comments was created less than one year ago");
+                    cache.insert(issue.number, created_at);
+                }
+                continue;
+            }
             if let Some(last_comment) = cache.get(&issue.number) {
                 if last_comment > &one_year_ago {
                     debug!("Issue {} found in triage cache", issue.number);
@@ -280,6 +299,7 @@ impl Paged for Event {
 struct Issue {
     number: u32,
     title: String,
+    comments: u32,
     pull_request: Option<PullRequest>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -468,7 +488,13 @@ fn cache_path(date: &chrono::NaiveDate, cache_type: CacheType) -> String {
 
 async fn fetch_issues_for_date(date: chrono::NaiveDate) -> Result<Vec<Issue>> {
     fetch_for_date(date, |page| {
-        github::fetch_issue_page(page, 100, &[], github::Direction::NewestFirst)
+        github::fetch_issue_page(
+            page,
+            100,
+            &[],
+            github::SortedBy::Comments,
+            github::Direction::NewestFirst,
+        )
     })
     .await
 }

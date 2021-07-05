@@ -19,18 +19,11 @@ pub(crate) async fn fetch_issue_page(
     page: u32,
     per_page: u8,
     labels: &[String],
+    sort_by: SortedBy,
     direction: Direction,
 ) -> Result<Vec<Issue>> {
     debug!("Fetching issue page {}", page);
-    fetch_page(
-        "issues",
-        page,
-        per_page,
-        labels,
-        SortedBy::Created,
-        direction,
-    )
-    .await
+    fetch_page("issues", page, per_page, labels, sort_by, direction).await
 }
 
 pub(crate) async fn fetch_comment_page(
@@ -109,6 +102,8 @@ pub(crate) async fn fetch_page<T: serde::de::DeserializeOwned>(
     fetch(path, &params).await
 }
 
+const MAX_RETRIES: usize = 3;
+
 pub(crate) async fn fetch<T: serde::de::DeserializeOwned>(
     path: &str,
     params: &[(&str, String)],
@@ -118,15 +113,33 @@ pub(crate) async fn fetch<T: serde::de::DeserializeOwned>(
         .map(|(k, v)| format!("{}={}", k, v))
         .collect::<Vec<_>>()
         .join("&");
-    Ok(Client::new()
-        .get(format!(
-            "https://api.github.com/repos/rust-lang/rust/{}?{}",
-            path, params
-        ))
-        .header("Accept", " application/vnd.github.v3+json")
-        .header("User-Agent", "rust-triage-tracker")
-        .send()
-        .await?
+    let mut num_retries = 0;
+    let response = loop {
+        let sent = Client::new()
+            .get(format!(
+                "https://api.github.com/repos/rust-lang/rust/{}?{}",
+                path, params
+            ))
+            .header("Accept", " application/vnd.github.v3+json")
+            .header("User-Agent", "rust-triage-tracker")
+            .send()
+            .await;
+        match sent {
+            Ok(r) => break r,
+            Err(e) => {
+                num_retries += 1;
+                if num_retries > MAX_RETRIES {
+                    return Err(e.into());
+                }
+                debug!("Error sending request: {}\nRetrying...", e);
+
+                // TODO: maybe exponential back off is better?
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    };
+
+    Ok(response
         .error_for_status()
         .map_err(|e| -> Error {
             if let Some(reqwest::StatusCode::FORBIDDEN) = e.status() {
