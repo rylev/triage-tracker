@@ -77,7 +77,7 @@ async fn handle_triaged(tags: Vec<String>) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     };
-    match perform_loop(&tags, &mut untriaged, &mut cache).await {
+    let result = match perform_loop(&tags, &mut untriaged, &mut cache).await {
         r @ Ok(()) | r @ Err(Error::RateLimited) => {
             let cache = serde_json::to_vec(&cache).unwrap();
             if let Err(e) = tokio::fs::write("./database/triage.json", cache).await {
@@ -86,8 +86,15 @@ async fn handle_triaged(tags: Vec<String>) -> Result<()> {
             r
         }
         Err(e) => return Err(e),
-    }?;
-    println!("{} untriaged issues:", untriaged.len());
+    };
+    if let Err(Error::RateLimited) = result {
+        eprintln!("Error: hit Github rate limiting. Stop early");
+    }
+    println!(
+        "{} untriaged issue{} found:",
+        untriaged.len(),
+        if untriaged.len() != 1 { "s" } else { "" }
+    );
     for issue in untriaged {
         println!("https://github.com/rust-lang/rust/issues/{}", issue.number);
     }
