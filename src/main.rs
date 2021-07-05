@@ -40,6 +40,8 @@ enum ClosingsCommand {
 #[derive(StructOpt, Debug)]
 struct TriagedCommand {
     tags: Vec<String>,
+    #[structopt(short, long)]
+    since: Option<String>,
 }
 
 #[tokio::main]
@@ -56,14 +58,17 @@ async fn main() {
             let end = end.parse::<chrono::NaiveDate>().unwrap();
             handle_range(start, end).await
         }
-        Command::Triaged(TriagedCommand { tags }) => handle_triaged(tags).await,
+        Command::Triaged(TriagedCommand { tags, since }) => {
+            let since = since.map(|s| s.parse::<chrono::NaiveDate>().unwrap());
+            handle_triaged(tags, since).await
+        }
     };
     if let Err(e) = result {
         eprintln!("Error: {}", e);
     }
 }
 
-async fn handle_triaged(tags: Vec<String>) -> Result<()> {
+async fn handle_triaged(tags: Vec<String>, since: Option<chrono::NaiveDate>) -> Result<()> {
     let mut untriaged = Vec::new();
     let mut cache = {
         match tokio::fs::read_to_string("./database/triage.json").await {
@@ -77,7 +82,11 @@ async fn handle_triaged(tags: Vec<String>) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     };
-    let result = match perform_triage_loop(&tags, &mut untriaged, &mut cache).await {
+    let since = since.unwrap_or_else(|| {
+        let today = chrono::Local::today().naive_local();
+        today - chrono::Duration::days(365)
+    });
+    let result = match perform_triage_loop(&tags, since, &mut untriaged, &mut cache).await {
         r @ Ok(()) | r @ Err(Error::RateLimited) => {
             let cache = serde_json::to_vec(&cache).unwrap();
             if let Err(e) = tokio::fs::write("./database/triage.json", cache).await {
@@ -103,6 +112,7 @@ async fn handle_triaged(tags: Vec<String>) -> Result<()> {
 
 async fn perform_triage_loop(
     tags: &[String],
+    yard_stick: chrono::NaiveDate,
     untriaged: &mut Vec<Issue>,
     cache: &mut HashMap<u32, chrono::NaiveDate>,
 ) -> Result<()> {
@@ -120,30 +130,28 @@ async fn perform_triage_loop(
             debug!("No more issues in page. Breaking...");
             break;
         }
-        let today = chrono::Local::today().naive_local();
-        let one_year_ago = today - chrono::Duration::days(365);
         for issue in issues {
             if issue.comments == 0 {
                 debug!("Issue #{} has no comments", issue.number);
                 // Issue has no comments
                 let created_at = issue.created_at.date().naive_local();
-                if created_at < one_year_ago {
-                    debug!("Issue without comments was created more than one year ago");
+                if created_at < yard_stick {
+                    debug!("Issue without comments was created before selected date");
                     untriaged.push(issue);
                 } else {
-                    debug!("Issue without comments was created less than one year ago");
+                    debug!("Issue without comments was created after after selected date");
                     cache.insert(issue.number, created_at);
                 }
                 continue;
             }
             if let Some(last_comment) = cache.get(&issue.number) {
-                if last_comment > &one_year_ago {
+                if last_comment > &yard_stick {
                     debug!("Issue {} found in triage cache", issue.number);
                     continue;
                 }
             }
             let comments =
-                github::fetch_comment_page(issue.number, 1, 100, Some(one_year_ago)).await?;
+                github::fetch_comment_page(issue.number, 1, 100, Some(yard_stick)).await?;
             if comments.is_empty() {
                 untriaged.push(issue);
             } else if comments.len() < 100 {
