@@ -4,8 +4,11 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use structopt::StructOpt;
 
+mod error;
 mod github;
 mod gui;
+
+use error::Error;
 
 #[derive(StructOpt, Debug)]
 struct App {
@@ -40,22 +43,24 @@ struct TriagedCommand {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     env_logger::init();
     let app = App::from_args();
-    match app.command {
+    let result = match app.command {
         Command::Closings(ClosingsCommand::Date { date }) => {
             let date = date.parse::<chrono::NaiveDate>().unwrap();
-            handle_date(date).await?;
+            handle_date(date).await
         }
         Command::Closings(ClosingsCommand::Range { start, end }) => {
             let start = start.parse::<chrono::NaiveDate>().unwrap();
             let end = end.parse::<chrono::NaiveDate>().unwrap();
-            handle_range(start, end).await?;
+            handle_range(start, end).await
         }
-        Command::Triaged(TriagedCommand { tags }) => handle_triaged(tags).await?,
+        Command::Triaged(TriagedCommand { tags }) => handle_triaged(tags).await,
+    };
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
     }
-    Ok(())
 }
 
 async fn handle_triaged(tags: Vec<String>) -> Result<()> {
@@ -73,14 +78,15 @@ async fn handle_triaged(tags: Vec<String>) -> Result<()> {
         }
     };
     match perform_loop(&tags, &mut untriaged, &mut cache).await {
-        Ok(()) | Err(Error::RateLimited) => {
+        r @ Ok(()) | r @ Err(Error::RateLimited) => {
             let cache = serde_json::to_vec(&cache).unwrap();
             if let Err(e) = tokio::fs::write("./database/triage.json", cache).await {
                 debug!("Writting cache failed: {}", e);
             }
+            r
         }
         Err(e) => return Err(e),
-    }
+    }?;
     println!("{} untriaged issues:", untriaged.len());
     for issue in untriaged {
         println!("https://github.com/rust-lang/rust/issues/{}", issue.number);
@@ -172,50 +178,6 @@ async fn handle_range(start: chrono::NaiveDate, end: chrono::NaiveDate) -> Resul
     Ok(())
 }
 
-type BoxedError = Box<dyn std::error::Error + Send + Sync>;
-
-#[derive(Debug)]
-enum Error {
-    RateLimited,
-    Other(BoxedError),
-}
-
-impl From<&str> for Error {
-    fn from(error: &str) -> Self {
-        Self::Other(error.into())
-    }
-}
-impl From<std::io::Error> for Error {
-    fn from(error: std::io::Error) -> Self {
-        Self::Other(error.into())
-    }
-}
-impl From<serde_json::Error> for Error {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Other(error.into())
-    }
-}
-impl From<reqwest::Error> for Error {
-    fn from(error: reqwest::Error) -> Self {
-        Self::Other(error.into())
-    }
-}
-impl From<BoxedError> for Error {
-    fn from(error: BoxedError) -> Self {
-        Self::Other(error)
-    }
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RateLimited => f.write_str("hit GitHub rate limiting"),
-            Self::Other(o) => f.write_fmt(format_args!("{}", o)),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
