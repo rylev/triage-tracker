@@ -128,9 +128,9 @@ pub(crate) async fn fetch<T: serde::de::DeserializeOwned>(
         .send()
         .await?
         .error_for_status()
-        .map_err(|e| -> BoxedError {
+        .map_err(|e| -> Error {
             if let Some(reqwest::StatusCode::FORBIDDEN) = e.status() {
-                "hit the GitHub rate limit".into()
+                Error::RateLimited
             } else {
                 e.into()
             }

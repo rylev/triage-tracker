@@ -64,12 +64,35 @@ async fn handle_triaged(tags: Vec<String>) -> Result<()> {
         match tokio::fs::read_to_string("./database/triage.json").await {
             Ok(f) => serde_json::from_str::<HashMap<u32, chrono::NaiveDate>>(&f)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tokio::fs::write("./database/triage.json", "{}").await?;
+                if let Err(e) = tokio::fs::write("./database/triage.json", "{}").await {
+                    debug!("Writing empty cache failed: {}", e);
+                }
                 HashMap::new()
             }
             Err(e) => return Err(e.into()),
         }
     };
+    match perform_loop(&tags, &mut untriaged, &mut cache).await {
+        Ok(()) | Err(Error::RateLimited) => {
+            let cache = serde_json::to_vec(&cache).unwrap();
+            if let Err(e) = tokio::fs::write("./database/triage.json", cache).await {
+                debug!("Writting cache failed: {}", e);
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    println!("{} untriaged issues:", untriaged.len());
+    for issue in untriaged {
+        println!("https://github.com/rust-lang/rust/issues/{}", issue.number);
+    }
+    Ok(())
+}
+
+async fn perform_loop(
+    tags: &[String],
+    untriaged: &mut Vec<Issue>,
+    cache: &mut HashMap<u32, chrono::NaiveDate>,
+) -> Result<()> {
     let mut page = 1;
     loop {
         let issues =
@@ -102,12 +125,6 @@ async fn handle_triaged(tags: Vec<String>) -> Result<()> {
             }
         }
         page += 1;
-    }
-    let cache = serde_json::to_vec(&cache).unwrap();
-    let _ = tokio::fs::write("./database/triage.json", cache).await;
-    println!("{} untriaged issues:", untriaged.len());
-    for issue in untriaged {
-        println!("https://github.com/rust-lang/rust/issues/{}", issue.number);
     }
     Ok(())
 }
@@ -156,7 +173,50 @@ async fn handle_range(start: chrono::NaiveDate, end: chrono::NaiveDate) -> Resul
 }
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync>;
-type Result<T> = std::result::Result<T, BoxedError>;
+
+#[derive(Debug)]
+enum Error {
+    RateLimited,
+    Other(BoxedError),
+}
+
+impl From<&str> for Error {
+    fn from(error: &str) -> Self {
+        Self::Other(error.into())
+    }
+}
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::Other(error.into())
+    }
+}
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Other(error.into())
+    }
+}
+impl From<reqwest::Error> for Error {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Other(error.into())
+    }
+}
+impl From<BoxedError> for Error {
+    fn from(error: BoxedError) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimited => f.write_str("hit GitHub rate limiting"),
+            Self::Other(o) => f.write_fmt(format_args!("{}", o)),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 enum IssueOrEvent {
