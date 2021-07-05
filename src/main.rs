@@ -1,8 +1,9 @@
+use chrono::NaiveDate;
 use log::debug;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use structopt::StructOpt;
 
+mod github;
 mod gui;
 
 #[derive(StructOpt, Debug)]
@@ -15,6 +16,8 @@ struct App {
 enum Command {
     /// Track net closings of issues
     Closings(ClosingsCommand),
+    /// Track triaged issues
+    Triaged(TriagedCommand),
 }
 
 #[derive(StructOpt, Debug)]
@@ -28,6 +31,11 @@ enum ClosingsCommand {
         #[structopt(short, long)]
         end: String,
     },
+}
+
+#[derive(StructOpt, Debug)]
+struct TriagedCommand {
+    tags: Vec<String>,
 }
 
 #[tokio::main]
@@ -44,6 +52,31 @@ async fn main() -> Result<()> {
             let end = end.parse::<chrono::NaiveDate>().unwrap();
             handle_range(start, end).await?;
         }
+        Command::Triaged(TriagedCommand { tags }) => handle_triaged(tags).await?,
+    }
+    Ok(())
+}
+
+async fn handle_triaged(tags: Vec<String>) -> Result<()> {
+    let issues = github::fetch_issue_page(1, 10, &tags, github::Direction::OldestFirst).await?;
+    let today = chrono::Local::today().naive_local();
+    let mut untriaged = Vec::new();
+    for issue in issues {
+        let comments = github::fetch_comment_page(
+            issue.number,
+            1,
+            100,
+            Some(today - chrono::Duration::days(365)),
+        )
+        .await?;
+        if comments.is_empty() {
+            untriaged.push(issue);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    println!("{} untriaged issues:", untriaged.len());
+    for issue in untriaged {
+        println!("https://github.com/rust-lang/rust/issues/{}", issue.number);
     }
     Ok(())
 }
@@ -222,6 +255,12 @@ impl std::fmt::Display for Issue {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct Comment {
+    body: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct PullRequest {}
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -368,11 +407,14 @@ fn cache_path(date: &chrono::NaiveDate, cache_type: CacheType) -> String {
 }
 
 async fn fetch_issues_for_date(date: chrono::NaiveDate) -> Result<Vec<Issue>> {
-    fetch_for_date(date, |page| fetch_issue_page(page, 100)).await
+    fetch_for_date(date, |page| {
+        github::fetch_issue_page(page, 100, &[], github::Direction::NewestFirst)
+    })
+    .await
 }
 
 async fn fetch_events_for_date(date: chrono::NaiveDate) -> Result<Vec<Event>> {
-    fetch_for_date(date, |page| fetch_event_page(page, 100)).await
+    fetch_for_date(date, |page| github::fetch_event_page(page, 100)).await
 }
 
 async fn fetch_for_date<T, F, Fut>(date: chrono::NaiveDate, fetch: F) -> Result<Vec<T>>
@@ -456,41 +498,4 @@ where
     }
 
     Ok(items)
-}
-
-async fn fetch_event_page(page: u32, per_page: u8) -> Result<Vec<Event>> {
-    debug!("Fetching event page {}", page);
-    fetch_page("issues/events", page, per_page).await
-}
-
-async fn fetch_issue_page(page: u32, per_page: u8) -> Result<Vec<Issue>> {
-    debug!("Fetching issue page {}", page);
-    fetch_page("issues", page, per_page).await
-}
-
-async fn fetch_page<T: serde::de::DeserializeOwned>(
-    path: &str,
-    page: u32,
-    per_page: u8,
-) -> Result<Vec<T>> {
-    assert!(per_page <= 100);
-    Ok(Client::new()
-        .get(format!(
-            "https://api.github.com/repos/rust-lang/rust/{}?per_page={}&page={}",
-            path, per_page, page
-        ))
-        .header("Accept", " application/vnd.github.v3+json")
-        .header("User-Agent", "rust-triage-tracker")
-        .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| -> BoxedError {
-            if let Some(reqwest::StatusCode::FORBIDDEN) = e.status() {
-                "hit the GitHub rate limit".into()
-            } else {
-                e.into()
-            }
-        })?
-        .json()
-        .await?)
 }
