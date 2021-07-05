@@ -1,53 +1,170 @@
-use clap::{App, Arg};
-use log::debug;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
+use log::debug;
+use serde::{Deserialize, Serialize};
+use structopt::StructOpt;
+
+mod error;
+mod github;
 mod gui;
 
+use error::Error;
+
+#[derive(StructOpt, Debug)]
+struct App {
+    #[structopt(subcommand)]
+    command: Command,
+}
+
+#[derive(StructOpt, Debug)]
+enum Command {
+    /// Track net closings of issues
+    Closings(ClosingsCommand),
+    /// Track triaged issues
+    Triaged(TriagedCommand),
+}
+
+#[derive(StructOpt, Debug)]
+enum ClosingsCommand {
+    /// Print open and closed issues for a specific date
+    Date { date: String },
+    /// Print open and closed issues for a range of dates
+    Range {
+        #[structopt(short, long)]
+        start: String,
+        #[structopt(short, long)]
+        end: String,
+    },
+}
+
+#[derive(StructOpt, Debug)]
+struct TriagedCommand {
+    tags: Vec<String>,
+    #[structopt(short, long)]
+    since: Option<String>,
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     env_logger::init();
-    let matches = App::new("Triage Tracker")
-        .arg(
-            Arg::with_name("date")
-                .short("d")
-                .long("date")
-                .value_name("DATE")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("start")
-                .short("s")
-                .long("start")
-                .value_name("DATE")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("end")
-                .short("e")
-                .long("end")
-                .value_name("DATE")
-                .takes_value(true),
-        )
-        .get_matches();
-    match (
-        matches.value_of("date"),
-        matches.value_of("start"),
-        matches.value_of("end"),
-    ) {
-        (Some(d), None, None) => {
-            let date = d.parse::<chrono::NaiveDate>().unwrap();
-            handle_date(date).await?;
+    let app = App::from_args();
+    let result = match app.command {
+        Command::Closings(ClosingsCommand::Date { date }) => {
+            let date = date.parse::<chrono::NaiveDate>().unwrap();
+            handle_date(date).await
         }
-        (None, Some(s), Some(e)) => {
-            let start = s.parse::<chrono::NaiveDate>().unwrap();
-            let end = e.parse::<chrono::NaiveDate>().unwrap();
-            handle_range(start, end).await?;
+        Command::Closings(ClosingsCommand::Range { start, end }) => {
+            let start = start.parse::<chrono::NaiveDate>().unwrap();
+            let end = end.parse::<chrono::NaiveDate>().unwrap();
+            handle_range(start, end).await
         }
-        _ => {
-            eprintln!("INVALID ARGS! TODO: Print help");
+        Command::Triaged(TriagedCommand { tags, since }) => {
+            let since = since.map(|s| s.parse::<chrono::NaiveDate>().unwrap());
+            handle_triaged(tags, since).await
         }
+    };
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+    }
+}
+
+async fn handle_triaged(tags: Vec<String>, since: Option<chrono::NaiveDate>) -> Result<()> {
+    let mut untriaged = Vec::new();
+    let mut cache = {
+        match tokio::fs::read_to_string("./database/triage.json").await {
+            Ok(f) => serde_json::from_str::<HashMap<u32, chrono::NaiveDate>>(&f)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(e) = tokio::fs::write("./database/triage.json", "{}").await {
+                    debug!("Writing empty cache failed: {}", e);
+                }
+                HashMap::new()
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let since = since.unwrap_or_else(|| {
+        let today = chrono::Local::today().naive_local();
+        today - chrono::Duration::days(365)
+    });
+    let result = match perform_triage_loop(&tags, since, &mut untriaged, &mut cache).await {
+        r @ Ok(()) | r @ Err(Error::RateLimited) => {
+            let cache = serde_json::to_vec(&cache).unwrap();
+            if let Err(e) = tokio::fs::write("./database/triage.json", cache).await {
+                debug!("Writting cache failed: {}", e);
+            }
+            r
+        }
+        Err(e) => return Err(e),
+    };
+    if let Err(Error::RateLimited) = result {
+        eprintln!("Error: hit Github rate limiting. Stop early");
+    }
+    println!(
+        "{} untriaged issue{} found:",
+        untriaged.len(),
+        if untriaged.len() != 1 { "s" } else { "" }
+    );
+    for issue in untriaged {
+        println!("https://github.com/rust-lang/rust/issues/{}", issue.number);
+    }
+    Ok(())
+}
+
+async fn perform_triage_loop(
+    tags: &[String],
+    yard_stick: chrono::NaiveDate,
+    untriaged: &mut Vec<Issue>,
+    cache: &mut HashMap<u32, chrono::NaiveDate>,
+) -> Result<()> {
+    let mut page = 1;
+    loop {
+        let issues = github::fetch_issue_page(
+            page,
+            100,
+            &tags,
+            github::SortedBy::Comments,
+            github::Direction::OldestFirst,
+        )
+        .await?;
+        if issues.is_empty() {
+            debug!("No more issues in page. Breaking...");
+            break;
+        }
+        for issue in issues {
+            if issue.comments == 0 {
+                debug!("Issue #{} has no comments", issue.number);
+                // Issue has no comments
+                let created_at = issue.created_at.date().naive_local();
+                if created_at < yard_stick {
+                    debug!("Issue without comments was created before selected date");
+                    untriaged.push(issue);
+                } else {
+                    debug!("Issue without comments was created after after selected date");
+                    cache.insert(issue.number, created_at);
+                }
+                continue;
+            }
+            if let Some(last_comment) = cache.get(&issue.number) {
+                if last_comment > &yard_stick {
+                    debug!("Issue {} found in triage cache", issue.number);
+                    continue;
+                }
+            }
+            let comments =
+                github::fetch_comment_page(issue.number, 1, 100, Some(yard_stick)).await?;
+            if comments.is_empty() {
+                untriaged.push(issue);
+            } else if comments.len() < 100 {
+                debug!("Inserting issue {} into cache", issue.number);
+                cache.insert(
+                    issue.number,
+                    comments.last().unwrap().created_at.naive_local().date(),
+                );
+            } else {
+                todo!("More than a 100 comments made in past year");
+            }
+        }
+        page += 1;
     }
     Ok(())
 }
@@ -95,8 +212,7 @@ async fn handle_range(start: chrono::NaiveDate, end: chrono::NaiveDate) -> Resul
     Ok(())
 }
 
-type BoxedError = Box<dyn std::error::Error + Send + Sync>;
-type Result<T> = std::result::Result<T, BoxedError>;
+type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 enum IssueOrEvent {
@@ -191,6 +307,7 @@ impl Paged for Event {
 struct Issue {
     number: u32,
     title: String,
+    comments: u32,
     pull_request: Option<PullRequest>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -223,6 +340,12 @@ impl std::fmt::Display for Issue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!("#{}: {}", self.number, self.title))
     }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Comment {
+    body: String,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -372,11 +495,20 @@ fn cache_path(date: &chrono::NaiveDate, cache_type: CacheType) -> String {
 }
 
 async fn fetch_issues_for_date(date: chrono::NaiveDate) -> Result<Vec<Issue>> {
-    fetch_for_date(date, |page| fetch_issue_page(page, 100)).await
+    fetch_for_date(date, |page| {
+        github::fetch_issue_page(
+            page,
+            100,
+            &[],
+            github::SortedBy::Comments,
+            github::Direction::NewestFirst,
+        )
+    })
+    .await
 }
 
 async fn fetch_events_for_date(date: chrono::NaiveDate) -> Result<Vec<Event>> {
-    fetch_for_date(date, |page| fetch_event_page(page, 100)).await
+    fetch_for_date(date, |page| github::fetch_event_page(page, 100)).await
 }
 
 async fn fetch_for_date<T, F, Fut>(date: chrono::NaiveDate, fetch: F) -> Result<Vec<T>>
@@ -460,41 +592,4 @@ where
     }
 
     Ok(items)
-}
-
-async fn fetch_event_page(page: u32, per_page: u8) -> Result<Vec<Event>> {
-    debug!("Fetching event page {}", page);
-    fetch_page("issues/events", page, per_page).await
-}
-
-async fn fetch_issue_page(page: u32, per_page: u8) -> Result<Vec<Issue>> {
-    debug!("Fetching issue page {}", page);
-    fetch_page("issues", page, per_page).await
-}
-
-async fn fetch_page<T: serde::de::DeserializeOwned>(
-    path: &str,
-    page: u32,
-    per_page: u8,
-) -> Result<Vec<T>> {
-    assert!(per_page <= 100);
-    Ok(Client::new()
-        .get(format!(
-            "https://api.github.com/repos/rust-lang/rust/{}?per_page={}&page={}",
-            path, per_page, page
-        ))
-        .header("Accept", " application/vnd.github.v3+json")
-        .header("User-Agent", "rust-triage-tracker")
-        .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| -> BoxedError {
-            if let Some(reqwest::StatusCode::FORBIDDEN) = e.status() {
-                "hit the GitHub rate limit".into()
-            } else {
-                e.into()
-            }
-        })?
-        .json()
-        .await?)
 }

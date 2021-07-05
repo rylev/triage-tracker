@@ -10,7 +10,7 @@ reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 chrono = { version = "0.4.19", features = ["serde"] }
 serde_json = "1.0"
-clap = "2.0"
+structopt = "0.3"
 tui = "0.15"
 termion = "1.5"
 log = "0.4"
