@@ -1,52 +1,48 @@
-use clap::{App, Arg};
 use log::debug;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use structopt::StructOpt;
 
 mod gui;
+
+#[derive(StructOpt, Debug)]
+struct App {
+    #[structopt(subcommand)]
+    command: Command,
+}
+
+#[derive(StructOpt, Debug)]
+enum Command {
+    /// Track net closings of issues
+    Closings(ClosingsCommand),
+}
+
+#[derive(StructOpt, Debug)]
+enum ClosingsCommand {
+    /// Print open and closed issues for a specific date
+    Date { date: String },
+    /// Print open and closed issues for a range of dates
+    Range {
+        #[structopt(short, long)]
+        start: String,
+        #[structopt(short, long)]
+        end: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
-    let matches = App::new("Triage Tracker")
-        .arg(
-            Arg::with_name("date")
-                .short("d")
-                .long("date")
-                .value_name("DATE")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("start")
-                .short("s")
-                .long("start")
-                .value_name("DATE")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("end")
-                .short("e")
-                .long("end")
-                .value_name("DATE")
-                .takes_value(true),
-        )
-        .get_matches();
-    match (
-        matches.value_of("date"),
-        matches.value_of("start"),
-        matches.value_of("end"),
-    ) {
-        (Some(d), None, None) => {
-            let date = d.parse::<chrono::NaiveDate>().unwrap();
+    let app = App::from_args();
+    match app.command {
+        Command::Closings(ClosingsCommand::Date { date }) => {
+            let date = date.parse::<chrono::NaiveDate>().unwrap();
             handle_date(date).await?;
         }
-        (None, Some(s), Some(e)) => {
-            let start = s.parse::<chrono::NaiveDate>().unwrap();
-            let end = e.parse::<chrono::NaiveDate>().unwrap();
+        Command::Closings(ClosingsCommand::Range { start, end }) => {
+            let start = start.parse::<chrono::NaiveDate>().unwrap();
+            let end = end.parse::<chrono::NaiveDate>().unwrap();
             handle_range(start, end).await?;
-        }
-        _ => {
-            eprintln!("INVALID ARGS! TODO: Print help");
         }
     }
     Ok(())
