@@ -288,16 +288,24 @@ impl Paged for Event {
     fn page_for_date(date: chrono::NaiveDate) -> u32 {
         let days_away = (chrono::Utc::today().naive_utc() - date).num_days();
         if days_away > 1 {
-            (days_away as u32) * Self::ESTIMATED_PAGES_PER_DAY
+            let answer = (days_away as u32) * Self::ESTIMATED_PAGES_PER_DAY;
+            debug!(
+                "Selected event page {} based on number of days away ({}) * estimated pages per day ({})",
+                answer,
+                days_away,
+                Self::ESTIMATED_PAGES_PER_DAY
+            );
+            answer
         } else if days_away == 1 {
             use chrono::Timelike;
             // TODO: this will change during the day and needs to be adjusted
             debug!(
-                "Selected yesterday: {} hours away",
+                "Selected event page 4 since date is yesterday: {} hours away",
                 chrono::Utc::now().time().hour()
             );
             4
         } else {
+            debug!("Selected event page 0 since date is today");
             0
         }
     }
@@ -500,7 +508,7 @@ async fn fetch_issues_for_date(date: chrono::NaiveDate) -> Result<Vec<Issue>> {
             page,
             100,
             &[],
-            github::SortedBy::Comments,
+            github::SortedBy::Created,
             github::Direction::NewestFirst,
         )
     })
@@ -558,23 +566,23 @@ where
             }
             None => {
                 // No items in this page matched the date
-                debug!(
-                    "No items for '{:?}' contained in page {}",
-                    date, page_number
-                );
                 let most_recent = &page[0].date();
                 let least_recent = &page[page_length - 1].date();
+                debug!(
+                    "No items for target date ({:?}) contained in page {} which spans from {:?} to {:?}",
+                    date, page_number, least_recent, most_recent
+                );
                 if least_recent > &date {
+                    debug!("The least recent item in page is further in future ({:?}) than the target date ({:?}). Going back in time...", least_recent, date);
                     let diff = (*least_recent - date).num_days() as u32;
-                    let pages = diff * T::ESTIMATED_PAGES_PER_DAY;
+                    let pages = diff * pages_per_day;
                     debug!(
                         "{} days in future... going back in time +{} pages",
                         diff, pages
                     );
                     page_number += pages;
                 } else {
-                    debug!("First item in page from '{:?}'", most_recent);
-                    debug!("Last item in page from '{:?}'", least_recent);
+                    debug!("The most recent item in page is further in past ({:?}) than the target date ({:?}). Going forward in time...", most_recent, date);
                     let diff = (date - *most_recent).num_days() as u32;
                     let pages = diff * pages_per_day;
                     debug!(
