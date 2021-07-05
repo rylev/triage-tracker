@@ -1,4 +1,5 @@
-use chrono::NaiveDate;
+use std::collections::HashMap;
+
 use log::debug;
 use serde::{Deserialize, Serialize};
 use structopt::StructOpt;
@@ -58,22 +59,52 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_triaged(tags: Vec<String>) -> Result<()> {
-    let issues = github::fetch_issue_page(1, 10, &tags, github::Direction::OldestFirst).await?;
-    let today = chrono::Local::today().naive_local();
     let mut untriaged = Vec::new();
-    for issue in issues {
-        let comments = github::fetch_comment_page(
-            issue.number,
-            1,
-            100,
-            Some(today - chrono::Duration::days(365)),
-        )
-        .await?;
-        if comments.is_empty() {
-            untriaged.push(issue);
+    let mut cache = {
+        match tokio::fs::read_to_string("./database/triage.json").await {
+            Ok(f) => serde_json::from_str::<HashMap<u32, chrono::NaiveDate>>(&f)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::write("./database/triage.json", "{}").await?;
+                HashMap::new()
+            }
+            Err(e) => return Err(e.into()),
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+    let mut page = 1;
+    loop {
+        let issues =
+            github::fetch_issue_page(page, 100, &tags, github::Direction::OldestFirst).await?;
+        if issues.is_empty() {
+            debug!("No more issues in page. Breaking...");
+            break;
+        }
+        let today = chrono::Local::today().naive_local();
+        let one_year_ago = today - chrono::Duration::days(365);
+        for issue in issues {
+            if let Some(last_comment) = cache.get(&issue.number) {
+                if last_comment > &one_year_ago {
+                    debug!("Issue {} found in triage cache", issue.number);
+                    continue;
+                }
+            }
+            let comments =
+                github::fetch_comment_page(issue.number, 1, 100, Some(one_year_ago)).await?;
+            if comments.is_empty() {
+                untriaged.push(issue);
+            } else if comments.len() < 100 {
+                debug!("Inserting issue {} into cache", issue.number);
+                cache.insert(
+                    issue.number,
+                    comments.last().unwrap().created_at.naive_local().date(),
+                );
+            } else {
+                todo!("More than a 100 comments made in past year");
+            }
+        }
+        page += 1;
     }
+    let cache = serde_json::to_vec(&cache).unwrap();
+    let _ = tokio::fs::write("./database/triage.json", cache).await;
     println!("{} untriaged issues:", untriaged.len());
     for issue in untriaged {
         println!("https://github.com/rust-lang/rust/issues/{}", issue.number);
