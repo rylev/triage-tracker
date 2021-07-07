@@ -88,6 +88,13 @@ enum Activity {
     LastCommented(chrono::NaiveDate),
 }
 
+/// The result of looking up in the cache
+enum CacheResult {
+    Fresh(Activity),
+    Stale(Activity),
+    NotFound,
+}
+
 impl TriageCache {
     async fn from_disk() -> Result<Self> {
         let internal = match tokio::fs::read_to_string("./database/triage.json").await {
@@ -107,16 +114,20 @@ impl TriageCache {
     }
 
     /// Get the cached activity for an issue
-    fn get(&self, issue_number: &u32, ttl: Option<chrono::Duration>) -> Option<Activity> {
-        self.internal.get(issue_number).and_then(|l| {
-            let now = chrono::Utc::now();
-            let ago = ttl.map(|ttl| now - ttl);
-            if ago.map(|ago| l.last_checked < ago).unwrap_or(false) {
-                None
-            } else {
-                Some(l.activity)
-            }
-        })
+    fn get(&self, issue_number: &u32, ttl: Option<chrono::Duration>) -> CacheResult {
+        self.internal
+            .get(issue_number)
+            .map(|l| {
+                debug!("Issue #{} found in triage cache", issue_number);
+                let now = chrono::Utc::now();
+                let ago = ttl.map(|ttl| now - ttl);
+                if ago.map(|ago| l.last_checked < ago).unwrap_or(false) {
+                    CacheResult::Stale(l.activity)
+                } else {
+                    CacheResult::Fresh(l.activity)
+                }
+            })
+            .unwrap_or(CacheResult::NotFound)
     }
 
     fn insert(&mut self, issue_number: u32, activity: Activity) {
@@ -172,8 +183,7 @@ async fn perform_triage_loop(
     untriaged: &mut Vec<Issue>,
     cache: &mut TriageCache,
 ) -> Result<()> {
-    let mut page = 5;
-    loop {
+    for page in 1.. {
         let issues = github::fetch_issue_page(
             page,
             100,
@@ -203,9 +213,8 @@ async fn perform_triage_loop(
             }
 
             match cache.get(&issue.number, Some(chrono::Duration::days(1))) {
-                Some(Activity::LastCommented(last_comment)) => {
+                CacheResult::Fresh(Activity::LastCommented(last_comment)) => {
                     let issue_number = issue.number;
-                    debug!("Issue #{} found in triage cache", issue_number);
                     let direction = if last_comment < last_active_yard_stick {
                         untriaged.push(issue);
                         "before"
@@ -219,8 +228,7 @@ async fn perform_triage_loop(
                     // We have an answer so go on to next issue
                     continue;
                 }
-                Some(Activity::NoActivitySince(no_activity_since)) => {
-                    debug!("Issue #{} found in triage cache", issue.number);
+                CacheResult::Fresh(Activity::NoActivitySince(no_activity_since)) => {
                     if no_activity_since <= last_active_yard_stick {
                         debug!(
                             "Issue #{} was last active (sometime before {:?}) before the yard stick ({:?})",
@@ -239,7 +247,14 @@ async fn perform_triage_loop(
                         // We don't know when the issue was last active, we need to determine that
                     }
                 }
-                None => {
+                CacheResult::Stale(Activity::LastCommented(last_commented))
+                    if last_commented > last_active_yard_stick =>
+                {
+                    // Even though the result is stale, we still know that there is a comment more recent than
+                    // the yard stick. It's possible there's an even *more* recent comment, but that's not relevant.
+                    continue;
+                }
+                _ => {
                     debug!("Issue #{} not found in cache.", issue.number);
                 }
             }
@@ -269,7 +284,6 @@ async fn perform_triage_loop(
                 todo!("More than a 100 comments made in past year");
             }
         }
-        page += 1;
     }
     Ok(())
 }
