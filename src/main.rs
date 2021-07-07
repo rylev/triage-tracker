@@ -68,30 +68,96 @@ async fn main() {
     }
 }
 
+struct TriageCache {
+    internal: HashMap<u32, TriageCacheLine>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct TriageCacheLine {
+    /// The type of activity.
+    activity: Activity,
+    last_checked: chrono::DateTime<chrono::Utc>,
+}
+
+// Type of activity we know about an issue
+#[derive(Debug, Serialize, Deserialize, Copy, Clone)]
+enum Activity {
+    /// We have not seen an activity since the given date, but
+    /// there might be some before
+    NoActivitySince(chrono::NaiveDate),
+    /// The last comment was on the given date
+    LastCommented(chrono::NaiveDate),
+}
+
+/// The result of looking up in the cache
+enum CacheResult {
+    Fresh(Activity),
+    Stale(Activity),
+    NotFound,
+}
+
+impl TriageCache {
+    async fn from_disk() -> Result<Self> {
+        let internal = match tokio::fs::read_to_string("./database/triage.json").await {
+            Ok(f) => serde_json::from_str::<HashMap<u32, TriageCacheLine>>(&f).ok(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let None = internal {
+            if let Err(e) = tokio::fs::write("./database/triage.json", "{}").await {
+                debug!("Writing empty cache failed: {}", e);
+            }
+        }
+
+        Ok(Self {
+            internal: internal.unwrap_or_default(),
+        })
+    }
+
+    /// Get the cached activity for an issue
+    fn get(&self, issue_number: &u32, ttl: Option<chrono::Duration>) -> CacheResult {
+        self.internal
+            .get(issue_number)
+            .map(|l| {
+                debug!("Issue #{} found in triage cache", issue_number);
+                let now = chrono::Utc::now();
+                let ago = ttl.map(|ttl| now - ttl);
+                if ago.map(|ago| l.last_checked < ago).unwrap_or(false) {
+                    CacheResult::Stale(l.activity)
+                } else {
+                    CacheResult::Fresh(l.activity)
+                }
+            })
+            .unwrap_or(CacheResult::NotFound)
+    }
+
+    fn insert(&mut self, issue_number: u32, activity: Activity) {
+        debug!("Inserting issue #{} into cache", issue_number);
+        let cache_line = TriageCacheLine {
+            activity,
+            last_checked: chrono::Utc::now(),
+        };
+        self.internal.insert(issue_number, cache_line);
+    }
+
+    async fn flush(&self) -> Result<()> {
+        let cache = serde_json::to_vec(&self.internal).unwrap();
+        if let Err(e) = tokio::fs::write("./database/triage.json", cache).await {
+            debug!("Writting cache failed: {}", e);
+        }
+        Ok(())
+    }
+}
+
 async fn handle_triaged(tags: Vec<String>, since: Option<chrono::NaiveDate>) -> Result<()> {
     let mut untriaged = Vec::new();
-    let mut cache = {
-        match tokio::fs::read_to_string("./database/triage.json").await {
-            Ok(f) => serde_json::from_str::<HashMap<u32, chrono::NaiveDate>>(&f)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Err(e) = tokio::fs::write("./database/triage.json", "{}").await {
-                    debug!("Writing empty cache failed: {}", e);
-                }
-                HashMap::new()
-            }
-            Err(e) => return Err(e.into()),
-        }
-    };
+    let mut cache = TriageCache::from_disk().await?;
     let since = since.unwrap_or_else(|| {
         let today = chrono::Local::today().naive_local();
         today - chrono::Duration::days(365)
     });
     let result = match perform_triage_loop(&tags, since, &mut untriaged, &mut cache).await {
         r @ Ok(()) | r @ Err(Error::RateLimited) => {
-            let cache = serde_json::to_vec(&cache).unwrap();
-            if let Err(e) = tokio::fs::write("./database/triage.json", cache).await {
-                debug!("Writting cache failed: {}", e);
-            }
+            cache.flush().await?;
             r
         }
         Err(e) => return Err(e),
@@ -110,14 +176,14 @@ async fn handle_triaged(tags: Vec<String>, since: Option<chrono::NaiveDate>) -> 
     Ok(())
 }
 
+/// Check which issues given with `tags` were last active before the `last_active_yard_stick`
 async fn perform_triage_loop(
     tags: &[String],
-    yard_stick: chrono::NaiveDate,
+    last_active_yard_stick: chrono::NaiveDate,
     untriaged: &mut Vec<Issue>,
-    cache: &mut HashMap<u32, chrono::NaiveDate>,
+    cache: &mut TriageCache,
 ) -> Result<()> {
-    let mut page = 1;
-    loop {
+    for page in 1.. {
         let issues = github::fetch_issue_page(
             page,
             100,
@@ -132,39 +198,92 @@ async fn perform_triage_loop(
         }
         for issue in issues {
             if issue.comments == 0 {
-                debug!("Issue #{} has no comments", issue.number);
                 // Issue has no comments
+                debug!("Issue #{} has no comments", issue.number);
                 let created_at = issue.created_at.date().naive_local();
-                if created_at < yard_stick {
-                    debug!("Issue without comments was created before selected date");
+                let issue_number = issue.number;
+                if created_at < last_active_yard_stick {
+                    debug!(
+                        "Issue #{} without comments was created before selected date",
+                        issue_number
+                    );
                     untriaged.push(issue);
-                } else {
-                    debug!("Issue without comments was created after after selected date");
-                    cache.insert(issue.number, created_at);
                 }
                 continue;
             }
-            if let Some(last_comment) = cache.get(&issue.number) {
-                if last_comment > &yard_stick {
-                    debug!("Issue {} found in triage cache", issue.number);
+
+            match cache.get(&issue.number, Some(chrono::Duration::days(1))) {
+                CacheResult::Fresh(Activity::LastCommented(last_comment)) => {
+                    let issue_number = issue.number;
+                    let direction = if last_comment < last_active_yard_stick {
+                        untriaged.push(issue);
+                        "before"
+                    } else {
+                        "after"
+                    };
+                    debug!(
+                        "Issue #{} was last commented on ({:?}) {} the yard stick ({:?})",
+                        issue_number, last_comment, direction, last_active_yard_stick
+                    );
+                    // We have an answer so go on to next issue
                     continue;
                 }
+                CacheResult::Fresh(Activity::NoActivitySince(no_activity_since)) => {
+                    if no_activity_since <= last_active_yard_stick {
+                        debug!(
+                            "Issue #{} was last active (sometime before {:?}) before the yard stick ({:?})",
+                            issue.number, no_activity_since, last_active_yard_stick
+                        );
+
+                        untriaged.push(issue);
+
+                        // We have an answer so go on to next issue
+                        continue;
+                    } else {
+                        debug!(
+                            "The yard stick ({:?}) is before when we have visibility ({:?}) on issue #{}",
+                            last_active_yard_stick, no_activity_since, issue.number
+                        );
+                        // We don't know when the issue was last active, we need to determine that
+                    }
+                }
+                CacheResult::Stale(Activity::LastCommented(last_commented))
+                    if last_commented > last_active_yard_stick =>
+                {
+                    // Even though the result is stale, we still know that there is a comment more recent than
+                    // the yard stick. It's possible there's an even *more* recent comment, but that's not relevant.
+                    continue;
+                }
+                _ => {
+                    debug!("Issue #{} not found in cache.", issue.number);
+                }
             }
+
+            debug!(
+                "State of issue #{} could not be determined from cache. Fetching comments...",
+                issue.number
+            );
+
             let comments =
-                github::fetch_comment_page(issue.number, 1, 100, Some(yard_stick)).await?;
+                github::fetch_comment_page(issue.number, 1, 100, Some(last_active_yard_stick))
+                    .await?;
             if comments.is_empty() {
-                untriaged.push(issue);
-            } else if comments.len() < 100 {
-                debug!("Inserting issue {} into cache", issue.number);
                 cache.insert(
                     issue.number,
-                    comments.last().unwrap().created_at.naive_local().date(),
+                    Activity::NoActivitySince(last_active_yard_stick),
+                );
+                untriaged.push(issue);
+            } else if comments.len() < 100 {
+                cache.insert(
+                    issue.number,
+                    Activity::LastCommented(
+                        comments.last().unwrap().created_at.naive_local().date(),
+                    ),
                 );
             } else {
                 todo!("More than a 100 comments made in past year");
             }
         }
-        page += 1;
     }
     Ok(())
 }
