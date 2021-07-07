@@ -197,6 +197,9 @@ async fn perform_triage_loop(
             break;
         }
         for issue in issues {
+            if issue.is_pull_request() {
+                continue;
+            }
             if issue.comments == 0 {
                 // Issue has no comments
                 debug!("Issue #{} has no comments", issue.number);
